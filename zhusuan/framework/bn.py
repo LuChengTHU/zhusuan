@@ -1120,6 +1120,38 @@ class BayesianNet(_BayesianNet, Context):
 
     bin_gumbel_softmax = bin_concrete
 
+    def flow(self,
+            name,
+            latents,
+            transformation,
+            flow_kwargs,
+            n_samples=None,
+            group_ndims=0,
+            dtype=tf.float32,
+            **kwargs):
+        """
+        Add a stochastic node in this :class:`BayesianNet` that follows the
+        Flow distribution.
+
+        :param name: The name of the stochastic node. Must be unique in a
+            :class:`BayesianNet`.
+
+        See
+        :class:`~zhusuan.distributions.univariate.FlowDistribution` for more
+        information about the other arguments.
+
+        :return: A :class:`StochasticTensor` instance.
+        """
+        dist = distributions.FlowDistribution(
+            latents,
+            transformation,
+            flow_kwargs,
+            group_ndims=group_ndims,
+            dtype=dtype,
+            **kwargs
+        )
+        return self.stochastic(name, dist, n_samples=n_samples, **kwargs)
+
     def exp_concrete(self,
                      name,
                      temperature,
