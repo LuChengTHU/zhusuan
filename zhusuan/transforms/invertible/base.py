@@ -22,8 +22,13 @@ class InvertibleTransform(object):
     
     def batch_shape(self):
         return self._batch_shape
+    
+    def prepare_shape(self, latents, **kwargs):
+        x, _ = self.inverse(latents, **kwargs)
+        self._get_batch_shape = x.get_shape()
+        self._batch_shape = tf.shape(x)
 
-    def _forward(self, x, *, **kwargs):
+    def _forward(self, x, **kwargs):
         """
         Forward computation.
 
@@ -37,7 +42,7 @@ class InvertibleTransform(object):
         """
         raise NotImplementedError
 
-    def _inverse(self, y, *, **kwargs):
+    def _inverse(self, y, **kwargs):
         """
         Inverse computation.
 
@@ -50,8 +55,12 @@ class InvertibleTransform(object):
         """
         raise NotImplementedError
 
+    def _sample(self, latents, **kwargs):
+        x, _ = self._inverse(latents, **kwargs)
+        return x
+
     @add_name_scope
-    def forward(self, x, *, **kwargs):
+    def forward(self, x, **kwargs):
         """
         Forward computation.
 
@@ -63,12 +72,10 @@ class InvertibleTransform(object):
         :return: the output transformed by the transformation.
         :return: a batch of log-determinants. May be None.
         """
-        self._get_batch_shape = x.get_shape()
-        self._batch_shape = tf.shape(x)
         return self._forward(x, **kwargs)
 
     @add_name_scope
-    def inverse(self, y, *, **kwargs):
+    def inverse(self, y, **kwargs):
         """
         Inverse computation.
 
@@ -80,7 +87,11 @@ class InvertibleTransform(object):
         :return: the reconstructed inputs.
         :return: a batch of log-determinants. May be None.
         """
-        return self._inverse(x, **kwargs)
+        return self._inverse(y, **kwargs)
+    
+    @add_name_scope
+    def sample(self, latents, **kwargs):
+        return self._sample(latents, **kwargs)
 
     @add_name_scope
     def gradients(self, outputs, log_det, loss, *, var_list=None, **kwargs):

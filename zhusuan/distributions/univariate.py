@@ -1403,6 +1403,9 @@ class BinConcrete(Distribution):
         return tf.exp(self._log_prob(given))
 
 
+BinGumbelSoftmax = BinConcrete
+
+
 class FlowDistribution(Distribution):
     """
     The class of univariate Flow distribution.
@@ -1410,7 +1413,7 @@ class FlowDistribution(Distribution):
     Inverse transformation(sample): latent -> inputs.
     See :class:`~zhusuan.distributions.base.Distribution` for details.
 
-    :param latent_distribution: zhusuan.distributions.base.Distribution
+    :param latents: latent stochastic tensor.
     :param transformation: zhusuan.transform.InvertibleTransform
     :param dtype: The value type of samples from the distribution. Can be
         int (`tf.int16`, `tf.int32`, `tf.int64`) or float (`tf.float16`,
@@ -1423,13 +1426,15 @@ class FlowDistribution(Distribution):
         explanation.
     """
 
-    def __init__(self, latent_distribution, transformation, flow_kwargs, dtype=tf.float32, group_ndims=0, **kwargs):
-        self._latent_distribution = latent_distribution
+    def __init__(self, latents, transformation, flow_kwargs, dtype=tf.float32, group_ndims=0, **kwargs):
+        self._latents = latents
         self._transformation = transformation
         self._flow_kwargs = flow_kwargs
         param_dtype = dtype
 
         assert_dtype_is_int_or_float(dtype)
+
+        self._transformation.prepare_shape(latents, **flow_kwargs)
 
         super(FlowDistribution, self).__init__(
             dtype=dtype,
@@ -1440,8 +1445,8 @@ class FlowDistribution(Distribution):
             **kwargs)
 
     @property
-    def latent_distribution(self):
-        return self._latent_distribution
+    def latents(self):
+        return self._latents
 
     @property
     def transformation(self):
@@ -1464,8 +1469,7 @@ class FlowDistribution(Distribution):
         return self.transformation.get_batch_shape()
 
     def _sample(self, n_samples):
-        latents = self.latent_distribution.sample(n_samples)
-        samples = tf.cast(self.transformation.inverse(latents, **self.flow_kwargs), self.dtype)
+        samples = tf.cast(tf.expand_dims(self.transformation.sample(self.latents, **self.flow_kwargs), 0), self.dtype)
         static_n_samples = n_samples if isinstance(n_samples, int) else None
         samples.set_shape(
             tf.TensorShape([static_n_samples]).concatenate(
@@ -1474,11 +1478,8 @@ class FlowDistribution(Distribution):
 
     def _log_prob(self, given):
         given = tf.cast(given, self.param_dtype)
-        latents, logd = self.transformation.forward(given, self.flow_kwargs)
-        return self.latent_distribution.log_prob(latents) + logd
+        latents, logd = self.transformation.forward(given, **self.flow_kwargs)
+        return tf.reshape(self.latents.dist.log_prob(latents) + logd, [given.get_shape()[0], 1, 1, 1])
 
     def _prob(self, given):
         return tf.exp(self._log_prob(given))
-
-
-BinGumbelSoftmax = BinConcrete

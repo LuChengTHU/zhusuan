@@ -6,10 +6,16 @@ from __future__ import division
 
 import tensorflow as tf
 import numpy as np
+from zhusuan.framework.bn import StochasticTensor
 from zhusuan.utils import add_name_scope
+from zhusuan.transforms.invertible.base import InvertibleTransform
+from zhusuan.transforms.ops.logistic import (
+    mixlogistic_logpdf, mixlogistic_logcdf, mixlogistic_invcdf
+)
 from zhusuan.transforms.ops.ops import (
-    dense, conv2d, nin, layernorm, init_normalization, inverse_sigmoid,
-    gated_conv, gated_attn, gated_nin, sumflat, gaussian_sample_logp
+    VarConfig, dense, conv2d, nin, layernorm, init_normalization, sumflat,
+    gated_conv, gated_attn, gated_nin, inverse_sigmoid, gaussian_sample_logp,
+    get_var,
 )
 
 
@@ -30,10 +36,10 @@ __all__ = [
 
 
 class Sequential(InvertibleTransform):
-    def __init__(self, layers, layer_names):
+    def __init__(self, layers):
         self.layers = layers
         
-    def _forward(self, x, *, **kwargs):
+    def _forward(self, x, **kwargs):
         bs = int((x[0] if isinstance(x, tuple) else x).shape[0])
         logd_terms = []
         for f in self.layers:
@@ -44,10 +50,10 @@ class Sequential(InvertibleTransform):
                 logd_terms.append(l)
         return x, tf.add_n(logd_terms) if logd_terms else tf.constant(0.) 
 
-    def _inverse(self, y, *, **kwargs):
+    def _inverse(self, y, **kwargs):
         bs = int((y[0] if isinstance(y, tuple) else y).shape[0])
         logd_terms = []
-        for f in reversed(self.layers[::-1]):
+        for f in reversed(self.layers):
             assert isinstance(f, InvertibleTransform)
             y, l = f.inverse(y, **kwargs)
             if l is not None:
@@ -65,10 +71,10 @@ class Inverse(InvertibleTransform):
     def __init__(self, base_flow):
         self.base_flow = base_flow
 
-    def _forward(self, x, *, **kwargs):
+    def _forward(self, x, **kwargs):
         return self.base_flow.inverse(x, **kwargs)
 
-    def _inverse(self, y, *, **kwargs):
+    def _inverse(self, y, **kwargs):
         return self.base_flow.forward(y, **kwargs)
 
 
@@ -76,7 +82,7 @@ class SpaceToDepth(InvertibleTransform):
     def __init__(self, block_size=2):
         self.block_size = block_size
 
-    def _forward(self, x, *, **kwargs):
+    def _forward(self, x, **kwargs):
         return tf.space_to_depth(x, self.block_size), None
 
     def _inverse(self, y, **kwargs):
@@ -84,15 +90,15 @@ class SpaceToDepth(InvertibleTransform):
 
 
 class CheckerboardSplit(InvertibleTransform):
-    def _forward(self, x, *, **kwargs):
-        assert isinstance(x, tf.Tensor)
+    def _forward(self, x, **kwargs):
+        assert isinstance(x, tf.Tensor) or isinstance(x, StochasticTensor)
         B, H, W, C = x.shape
         x = tf.reshape(x, [B, H, W // 2, 2, C])
         a, b = tf.unstack(x, axis=3)
         assert a.shape == b.shape == [B, H, W // 2, C]
         return (a, b), None
 
-    def _inverse(self, y, *, **kwargs):
+    def _inverse(self, y, **kwargs):
         assert isinstance(y, tuple)
         a, b = y
         assert a.shape == b.shape
@@ -103,36 +109,36 @@ class CheckerboardSplit(InvertibleTransform):
 
 
 class ChannelSplit(InvertibleTransform):
-    def _forward(self, x, *, **kwargs):
-        assert isinstance(x, tf.Tensor)
+    def _forward(self, x, **kwargs):
+        assert isinstance(x, tf.Tensor) or isinstance(x, StochasticTensor)
         assert len(x.shape) == 4 and x.shape[3] % 2 == 0
         return tuple(tf.split(x, 2, axis=3)), None
 
-    def _inverse(self, y, *, **kwargs):
+    def _inverse(self, y, **kwargs):
         assert isinstance(y, tuple)
         a, b = y
         return tf.concat([a, b], axis=3), None
 
 
 class TupleFlip(InvertibleTransform):
-    def _forward(self, x, *, **kwargs):
+    def _forward(self, x, **kwargs):
         assert isinstance(x, tuple)
         a, b = x
         return (b, a), None
 
-    def _inverse(self, y, *, **kwargs):
+    def _inverse(self, y, **kwargs):
         assert isinstance(y, tuple)
         a, b = y
         return (b, a), None
 
 
 class Sigmoid(InvertibleTransform):
-    def _forward(self, x, *, **kwargs):
+    def _forward(self, x, **kwargs):
         y = tf.sigmoid(x)
         logd = -tf.nn.softplus(x) - tf.nn.softplus(-x)
         return y, sumflat(logd)
 
-    def _inverse(self, y, *, **kwargs):
+    def _inverse(self, y, **kwargs):
         x = inverse_sigmoid(y)
         logd = -tf.log(y) - tf.log(1. - y)
         return x, sumflat(logd)
@@ -142,13 +148,13 @@ class ImgProc(InvertibleTransform):
     def __init__(self, max_val=256):
         self.max_val = max_val
 
-    def _forward(self, x, *, **kwargs):
+    def _forward(self, x, **kwargs):
         x = x * (.9 / self.max_val) + .05  # [0, self.max_val] -> [.05, .95]
         x, logd = Sigmoid().inverse(x)
         logd += np.log(.9 / self.max_val) * int(np.prod(x.shape.as_list()[1:]))
         return x, logd
 
-    def _inverse(self, y, *, **kwargs):
+    def _inverse(self, y, **kwargs):
         y, logd = Sigmoid().forward(y)
         y = (y - .05) / (.9 / self.max_val)  # [.05, .95] -> [0, self.max_val]
         logd -= np.log(.9 / self.max_val) * int(np.prod(y.shape.as_list()[1:]))
@@ -162,7 +168,7 @@ class ActNorm(InvertibleTransform):
             if isinstance(input_, tuple):
                 is_tuple = True
             else:
-                assert isinstance(input_, tf.Tensor)
+                assert isinstance(x, tf.Tensor) or isinstance(x, StochasticTensor)
                 input_ = [input_]
                 is_tuple = False
 
@@ -171,14 +177,15 @@ class ActNorm(InvertibleTransform):
             for (i, x) in enumerate(input_):
                 g, b = init_normalization(x, name='norm{}'.format(i), init_scale=init_scale, vcfg=vcfg)
                 g = tf.maximum(g, 1e-10)
-                assert x.shape[0] == bs and g.shape == b.shape == x.shape[1:]
+                assert x.shape[0] == bs
                 g_and_b.append((g, b))
 
-            logd = tf.fill([bs], tf.add_n([tf.reduce_sum(tf.log(g)) for (g, _) in g_and_b]))
+            H, W = x.get_shape().as_list()[1:3]
+            logd = tf.fill([bs], tf.add_n([tf.reduce_sum(tf.log(g)) * H * W for (g, _) in g_and_b]))
             if forward:
-                out = [x * g[None] + b[None] for (x, (g, b)) in zip(input_, g_and_b)]
+                out = [x * g + b for (x, (g, b)) in zip(input_, g_and_b)]
             else:
-                out = [(x - b[None]) / g[None] for (x, (g, b)) in zip(input_, g_and_b)]
+                out = [(x - b) / g for (x, (g, b)) in zip(input_, g_and_b)]
                 logd = -logd
 
             if not is_tuple:
@@ -188,10 +195,10 @@ class ActNorm(InvertibleTransform):
 
         self.template = tf.make_template(self.__class__.__name__, f)
 
-    def _forward(self, x, *, **kwargs):
+    def _forward(self, x, **kwargs):
         return self.template(x, forward=True, **kwargs)
 
-    def _inverse(self, y, *, **kwargs):
+    def _inverse(self, y, **kwargs):
         return self.template(y, forward=False, **kwargs)
 
 
@@ -202,7 +209,7 @@ class Pointwise(InvertibleTransform):
             if isinstance(input_, tuple):
                 is_tuple = True
             else:
-                assert isinstance(input_, tf.Tensor)
+                assert isinstance(input_, tf.Tensor) or isinstance(input_, StochasticTensor)
                 input_ = [input_]
                 is_tuple = False
 
@@ -243,10 +250,10 @@ class Pointwise(InvertibleTransform):
             x = x + b[None, :]
         return tf.reshape(x, s[:-1] + [out_dim])
 
-    def _forward(self, x, *, **kwargs):
+    def _forward(self, x, **kwargs):
         return self.template(x, forward=True, **kwargs)
 
-    def inverse(self, y, *, **kwargs):
+    def inverse(self, y, **kwargs):
         return self.template(y, forward=False, **kwargs)
 
 
@@ -259,12 +266,12 @@ class ElemwiseAffine(InvertibleTransform):
     def _get_logscales(self):
         return tf.log(self.scales) if (self.logscales is None) else self.logscales
 
-    def _forward(self, x, *, **kwargs):
+    def _forward(self, x, **kwargs):
         logscales = self._get_logscales()
         assert logscales.shape == x.shape
         return (x * self.scales + self.biases), sumflat(logscales)
 
-    def _inverse(self, y, *, **kwargs):
+    def _inverse(self, y, **kwargs):
         logscales = self._get_logscales()
         assert logscales.shape == y.shape
         return ((y - self.biases) / self.scales), sumflat(-logscales)
@@ -288,13 +295,13 @@ class MixLogisticCDF(InvertibleTransform):
             logscales=tf.maximum(self.logscales, self.min_logscale)
         )
 
-    def _forward(self, x, *, **kwargs):
+    def _forward(self, x, **kwargs):
         logistic_kwargs = self._get_logistic_kwargs()
         out = tf.exp(mixlogistic_logcdf(x=x, **logistic_kwargs))
         logd = mixlogistic_logpdf(x=x, **logistic_kwargs)
         return out, sumflat(logd)
 
-    def _inverse(self, y, *, **kwargs):
+    def _inverse(self, y, **kwargs):
         logistic_kwargs = self._get_logistic_kwargs()
         out = mixlogistic_invcdf(y=tf.clip_by_value(y, 0., 1.), **logistic_kwargs)
         logd = -mixlogistic_logpdf(x=out, **logistic_kwargs)
@@ -338,7 +345,7 @@ class MixLogisticAttnCoupling(InvertibleTransform):
             assert s.shape == t.shape == [B, H, W, C]
             assert ml_logits.shape == ml_means.shape == ml_logscales.shape == [B, H, W, C, components]
 
-            return Compose([
+            return Sequential([
                 MixLogisticCDF(logits=ml_logits, means=ml_means, logscales=ml_logscales),
                 Inverse(Sigmoid()),
                 ElemwiseAffine(scales=tf.exp(s), logscales=s, biases=t),
@@ -346,7 +353,7 @@ class MixLogisticAttnCoupling(InvertibleTransform):
 
         self.template = tf.make_template(self.__class__.__name__, f)
 
-    def _forward(self, x, *, **kwargs):
+    def _forward(self, x, **kwargs):
         assert isinstance(x, tuple)
         cf, ef = x
         flow = self.template(cf, **kwargs)
@@ -354,7 +361,7 @@ class MixLogisticAttnCoupling(InvertibleTransform):
         assert out.shape == ef.shape == cf.shape
         return (cf, out), logd
 
-    def _inverse(self, y, *, **kwargs):
+    def _inverse(self, y, **kwargs):
         assert isinstance(y, tuple)
         cf, ef = y
         flow = self.template(cf, **kwargs)
@@ -363,7 +370,7 @@ class MixLogisticAttnCoupling(InvertibleTransform):
         return (cf, out), logd
 
 
-class AffineCoupling(Flow):
+class AffineCoupling(InvertibleTransform):
     """
     pure flow, affine couping
     """
@@ -401,7 +408,7 @@ class AffineCoupling(Flow):
 
         self.template = tf.make_template(self.__class__.__name__, f)
 
-    def _forward(self, x, *, **kwargs):
+    def _forward(self, x, **kwargs):
         assert isinstance(x, tuple)
         cf, ef = x
         flow = self.template(cf, **kwargs)
@@ -409,7 +416,7 @@ class AffineCoupling(Flow):
         assert out.shape == ef.shape == cf.shape
         return (cf, out), logd
 
-    def _inverse(self, y, *, **kwargs):
+    def _inverse(self, y, **kwargs):
         assert isinstance(y, tuple)
         cf, ef = y
         flow = self.template(cf, **kwargs)

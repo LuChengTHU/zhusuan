@@ -13,6 +13,8 @@ from zhusuan.transforms.ops.logistic import (
 )
 
 __all__ = [
+    'VarConfig',
+    'get_var',
     'dense',
     'conv2d',
     'nin',
@@ -94,11 +96,11 @@ def nin(x, *, num_units, **kwargs):
 
 def init_normalization(x, *, name, init_scale=1., vcfg: VarConfig):
     with tf.variable_scope(name):
-        g = get_var('g', shape=x.shape[1:], initializer=tf.constant_initializer(1.), vcfg=vcfg)
-        b = get_var('b', shape=x.shape[1:], initializer=tf.constant_initializer(0.), vcfg=vcfg)
+        g = get_var('g', shape=(1, 1, 1, x.shape[-1]), initializer=tf.constant_initializer(1.), vcfg=vcfg)
+        b = get_var('b', shape=(1, 1, 1, x.shape[-1]), initializer=tf.constant_initializer(0.), vcfg=vcfg)
         if vcfg.init:
             # data based normalization
-            m_init, v_init = tf.nn.moments(x, [0])
+            m_init, v_init = tf.nn.moments(x, [0, 1, 2], keep_dims=True)
             scale_init = init_scale * tf.rsqrt(v_init + 1e-8)
             assert m_init.shape == v_init.shape == scale_init.shape == g.shape == b.shape
             with tf.control_dependencies([
